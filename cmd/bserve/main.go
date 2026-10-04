@@ -2,6 +2,8 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"mime"
@@ -30,27 +32,37 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Printf("serving %s on %s", os.Args[1], ln.Addr())
-	log.Fatal(serve(ln, root))
+	log.Fatal(serve(ln, root, 30*time.Second))
 }
 
 // ponytail: any Accept error stops the server; retry with backoff if it must survive fd exhaustion.
-func serve(ln net.Listener, root *os.Root) error {
+func serve(ln net.Listener, root *os.Root, idle time.Duration) error {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			return err
 		}
-		go handle(c, root)
+		go handle(c, root, idle)
 	}
 }
 
-// handle answers requests on one connection, in order, until the client closes it.
-func handle(c net.Conn, root *os.Root) {
+// handle answers requests on one connection, in order, until the client
+// closes it, sends something malformed, or is idle for longer than idle:
+// that is the time it gets to send each request and take its response.
+func handle(c net.Conn, root *os.Root, idle time.Duration) {
 	defer c.Close()
 	for {
+		c.SetDeadline(time.Now().Add(idle))
 		req, err := proto.ReadMessage(c, io.Discard)
-		if err != nil {
+		if err == nil && (req.Get(":method") == "" || !strings.HasPrefix(req.Get(":path"), "/")) {
+			err = fmt.Errorf("%w: request needs :method and a :path starting with /", proto.ErrMalformed)
+		}
+		if errors.Is(err, proto.ErrMalformed) {
+			badRequest(c, err)
 			return
+		}
+		if err != nil {
+			return // closed, idle, or cut off mid-frame
 		}
 		status, ctype, body := lookup(root, req)
 		log.Printf("%s %s %s %d", c.RemoteAddr(), req.Get(":method"), req.Get(":path"), status)
@@ -58,6 +70,20 @@ func handle(c net.Conn, root *os.Root) {
 			return
 		}
 	}
+}
+
+// badRequest sends a 400. The caller then closes the connection, since after
+// a malformed frame there is no telling where the next one starts.
+func badRequest(c net.Conn, reason error) {
+	log.Printf("%s 400 %v", c.RemoteAddr(), reason)
+	writeResponse(c, 400, textPlain, []byte("400 bad request: "+reason.Error()+"\n"))
+	// Closing with unread input sends a TCP RST, which can wipe the 400 from the
+	// client's receive buffer before it is read. Half-close, then drain briefly.
+	if hc, ok := c.(interface{ CloseWrite() error }); ok {
+		hc.CloseWrite()
+	}
+	c.SetReadDeadline(time.Now().Add(time.Second))
+	io.Copy(io.Discard, c)
 }
 
 // lookup maps a request to a file under root. os.Root refuses any path that

@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"encoding/hex"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,7 +20,7 @@ const indexHTML = "<h1>hi</h1>\n"
 
 // start serves a fresh root on a loopback port. Next to the root sits
 // secret.txt, which no request may reach.
-func start(t *testing.T) (addr, secret string) {
+func start(t *testing.T, idle time.Duration) (addr, secret string) {
 	dir := t.TempDir()
 	www := filepath.Join(dir, "www")
 	secret = filepath.Join(dir, "secret.txt")
@@ -43,7 +45,7 @@ func start(t *testing.T) (addr, secret string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ln.Close() })
-	go serve(ln, root)
+	go serve(ln, root, idle)
 	return ln.Addr().String(), secret
 }
 
@@ -81,7 +83,7 @@ func request(t *testing.T, method, path string) []byte {
 
 // The README §10 request, byte for byte.
 func TestSpecRequest(t *testing.T) {
-	addr, _ := start(t)
+	addr, _ := start(t, time.Minute)
 	wire, _ := hex.DecodeString("0101010000000035" + "010003474554" + "02000b2f696e6465782e68746d6c" +
 		"04000e6c6f63616c686f73743a39303030" + "050007626375726c2f31" + "0600032a2f2a")
 	h, body := do(t, dial(t, addr), wire)
@@ -98,7 +100,7 @@ func TestSpecRequest(t *testing.T) {
 
 // Every request below goes over the same connection: the server must keep it open.
 func TestOneConnection(t *testing.T) {
-	addr, _ := start(t)
+	addr, _ := start(t, time.Minute)
 	c := dial(t, addr)
 	for _, r := range []struct {
 		method, path, status, body string
@@ -120,7 +122,7 @@ func TestOneConnection(t *testing.T) {
 }
 
 func TestNothingOutsideRoot(t *testing.T) {
-	addr, secret := start(t)
+	addr, secret := start(t, time.Minute)
 	c := dial(t, addr)
 	for _, p := range []string{"/../secret.txt", "/sub/../../secret.txt", "/" + secret, "//" + secret, "/escape"} {
 		if h, body := do(t, c, request(t, "GET", p)); h.Get(":status") != "404" || strings.Contains(body, "SECRET") {
@@ -131,7 +133,7 @@ func TestNothingOutsideRoot(t *testing.T) {
 
 // A request body is read and thrown away, so the next request still lines up.
 func TestRequestBodyDiscarded(t *testing.T) {
-	addr, _ := start(t)
+	addr, _ := start(t, time.Minute)
 	c := dial(t, addr)
 	block, _ := proto.EncodeHeaders(proto.Headers{{Name: ":method", Value: "POST"}, {Name: ":path", Value: "/"}})
 	post := append(proto.Frame{Type: proto.TypeHeaders, Payload: block}.Encode(),
@@ -141,5 +143,77 @@ func TestRequestBodyDiscarded(t *testing.T) {
 	}
 	if h, body := do(t, c, request(t, "GET", "/")); h.Get(":status") != "200" || body != indexHTML {
 		t.Fatalf("GET after POST: got %v %q", h, body)
+	}
+}
+
+func unhex(t *testing.T, s string) []byte {
+	t.Helper()
+	b, err := hex.DecodeString(strings.Join(strings.Fields(s), ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// closed reports whether the server has closed c.
+func closed(c net.Conn) bool {
+	_, err := proto.ReadFrame(c)
+	return err == io.EOF
+}
+
+func TestMalformedGets400ThenClose(t *testing.T) {
+	addr, _ := start(t, time.Minute)
+	for _, m := range []struct{ name, wire string }{
+		{"version 2", "02 01 01 00 00 00 00 00"},
+		{"length 16385", "01 01 01 00 00 00 40 01" + strings.Repeat(" ff", 100)},
+		{"DATA first", "01 00 01 00 00 00 00 02 68 69"},
+		{"header index 11", "01 01 01 00 00 00 00 03 0b 00 00"},
+		{"truncated field", "01 01 01 00 00 00 00 02 01 00"},
+		{"HEADERS twice", "01 01 00 00 00 00 00 06 01 00 03 47 45 54 01 01 01 00 00 00 00 00"},
+		{"no :method", "01 01 01 00 00 00 00 04 02 00 01 2f"},
+		{":path without /", "01 01 01 00 00 00 00 0a 01 00 03 47 45 54 02 00 01 78"},
+	} {
+		c := dial(t, addr)
+		h, body := do(t, c, unhex(t, m.wire))
+		if h.Get(":status") != "400" || !strings.HasPrefix(body, "400 bad request: malformed") {
+			t.Errorf("%s: got %v %q", m.name, h, body)
+		}
+		if !closed(c) {
+			t.Errorf("%s: connection still open after 400", m.name)
+		}
+	}
+}
+
+// Unknown frame types are skipped before a request, inside a request body and
+// between requests, all on one connection.
+func TestSkipsUnknownFrames(t *testing.T) {
+	addr, _ := start(t, time.Minute)
+	c := dial(t, addr)
+	unknown := unhex(t, "01 7f 01 00 00 00 00 02 ff ff") // END set, and still ignored
+	block, _ := proto.EncodeHeaders(proto.Headers{{Name: ":method", Value: "GET"}, {Name: ":path", Value: "/"}})
+	open := proto.Frame{Type: proto.TypeHeaders, Payload: block}.Encode()
+	end := proto.Frame{Type: proto.TypeData, Flags: proto.FlagEnd}.Encode()
+	for i, wire := range [][]byte{
+		slices.Concat(unknown, unknown, request(t, "GET", "/")),
+		slices.Concat(request(t, "GET", "/"), unknown),
+		slices.Concat(open, unknown, end),
+	} {
+		if h, body := do(t, c, wire); h.Get(":status") != "200" || body != indexHTML {
+			t.Errorf("wire %d: got %v %q", i, h, body)
+		}
+	}
+}
+
+func TestIdleTimeout(t *testing.T) {
+	addr, _ := start(t, 200*time.Millisecond)
+	for name, wire := range map[string]string{
+		"silent client":   "",
+		"frame cut short": "01 01 01 00 00 00 00 0f 01 00 03 47 45 54", // promises 15 bytes, sends 6
+	} {
+		c := dial(t, addr)
+		c.Write(unhex(t, wire))
+		if !closed(c) {
+			t.Errorf("%s: not closed after idle timeout", name)
+		}
 	}
 }
