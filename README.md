@@ -3,6 +3,7 @@
 HTTP over a binary framing protocol: a file server (`bserve`) and a client (`bcurl`) that share nothing but the spec below.
 
 ```
+go build -o . ./cmd/...
 ./bserve ./www 9000
 ./bcurl -v localhost:9000/index.html
 ```
