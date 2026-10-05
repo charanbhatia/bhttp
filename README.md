@@ -8,6 +8,8 @@ go build -o . ./cmd/...
 ./bcurl -v localhost:9000/index.html
 ```
 
+`go test ./...` checks the codec and both programs against the spec's bytes, then runs the real `bcurl` against the real `bserve`.
+
 ## Spec: bhttp/1
 
 This section is enough to write a bhttp/1 client or server without reading our code.
