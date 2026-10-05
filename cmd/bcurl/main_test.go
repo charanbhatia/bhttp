@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net"
 	"slices"
@@ -149,5 +150,48 @@ func TestExitCodes(t *testing.T) {
 		if code, _, errs := bcurl(args...); code != c.want {
 			t.Errorf("%s: exit %d, want %d (%s)", c.name, code, c.want, errs)
 		}
+	}
+}
+
+func TestVerbose(t *testing.T) {
+	addr, _, _ := fake(t, ok200)
+	code, out, errs := bcurl("-v", addr+"/index.html")
+	if code != 0 || out != "hello" {
+		t.Fatalf("-v must not change stdout or the exit code: got %d %q", code, out)
+	}
+	sent := fmt.Sprintf("> HEADERS flags=0x01 length=%d\n", 39+len(addr))
+	for _, want := range []string{sent, ">   :method: GET\n", ">   host: " + addr + "\n", ">   accept: */*\n"} {
+		if !strings.Contains(errs, want) {
+			t.Errorf("missing %q in:\n%s", want, errs)
+		}
+	}
+	received := `< HEADERS flags=0x00 length=6
+< 00000000  01 01 00 00 00 00 00 06  03 00 03 32 30 30        |...........200|
+<   :status: 200
+< type=0x7f (unknown, skipped) flags=0x01 length=2
+< 00000000  01 7f 01 00 00 00 00 02  ff ff                    |..........|
+< DATA flags=0x00 length=3
+< 00000000  01 00 00 00 00 00 00 03  68 65 6c                 |........hel|
+< type=0x7f (unknown, skipped) flags=0x00 length=0
+< 00000000  01 7f 00 00 00 00 00 00                           |........|
+< DATA flags=0x01 length=2
+< 00000000  01 00 01 00 00 00 00 02  6c 6f                    |........lo|
+`
+	if _, got, _ := strings.Cut(errs, "< "); "< "+got != received {
+		t.Errorf("received frames:\ngot\n%s\nwant\n%s", "< "+got, received)
+	}
+}
+
+// TCP hands bytes over in arbitrary chunks; the dump must not depend on them.
+func TestDumperAnyChunking(t *testing.T) {
+	wire := unhex(t, ok200+" "+notFound404)
+	var whole, bytewise bytes.Buffer
+	(&dumper{w: &whole, mark: "<"}).Write(wire)
+	d := &dumper{w: &bytewise, mark: "<"}
+	for _, b := range wire {
+		d.Write([]byte{b})
+	}
+	if whole.String() != bytewise.String() || strings.Count(whole.String(), "length=") != 7 {
+		t.Fatalf("whole:\n%s\nbyte by byte:\n%s", whole.String(), bytewise.String())
 	}
 }

@@ -2,6 +2,8 @@
 package main
 
 import (
+	"encoding/binary"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -22,7 +24,8 @@ func main() {
 func run(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("bcurl", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	fs.Usage = func() { fmt.Fprintln(stderr, "usage: bcurl HOST:PORT/PATH ...") }
+	verbose := fs.Bool("v", false, "hexdump every frame sent (>) and received (<) to stderr")
+	fs.Usage = func() { fmt.Fprintln(stderr, "usage: bcurl [-v] HOST:PORT/PATH ...") }
 	if err := fs.Parse(args); err != nil || fs.NArg() == 0 {
 		fs.Usage()
 		return 2
@@ -44,9 +47,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	defer c.Close()
+	var rw io.ReadWriter = c
+	if *verbose {
+		rw = struct {
+			io.Reader
+			io.Writer
+		}{io.TeeReader(c, &dumper{w: stderr, mark: "<"}), io.MultiWriter(c, &dumper{w: stderr, mark: ">"})}
+	}
 	code := 0
 	for _, p := range paths {
-		status, err := fetch(c, host, p, stdout)
+		status, err := fetch(rw, host, p, stdout)
 		if err != nil {
 			fmt.Fprintf(stderr, "bcurl: %s: %v\n", p, err)
 			return 2
@@ -59,7 +69,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 // fetch sends one GET and copies the response body to body.
-func fetch(c net.Conn, host, path string, body io.Writer) (int, error) {
+func fetch(c io.ReadWriter, host, path string, body io.Writer) (int, error) {
 	block, err := proto.EncodeHeaders(proto.Headers{
 		{Name: ":method", Value: "GET"},
 		{Name: ":path", Value: path},
@@ -82,4 +92,43 @@ func fetch(c net.Conn, host, path string, body io.Writer) (int, error) {
 		return 0, fmt.Errorf("%w: :status %q", proto.ErrMalformed, h.Get(":status"))
 	}
 	return status, nil
+}
+
+// dumper hexdumps every complete frame written to it. Bytes may arrive in any
+// chunking; a frame is printed as soon as its last byte is in.
+type dumper struct {
+	w    io.Writer
+	mark string
+	buf  []byte
+}
+
+func (d *dumper) Write(p []byte) (int, error) {
+	d.buf = append(d.buf, p...)
+	for len(d.buf) >= proto.HeaderSize {
+		n := proto.HeaderSize + int(binary.BigEndian.Uint32(d.buf[4:]))
+		if len(d.buf) < n {
+			break
+		}
+		d.dump(d.buf[:n])
+		d.buf = d.buf[n:]
+	}
+	return len(p), nil
+}
+
+func (d *dumper) dump(frame []byte) {
+	typ, flags, payload := frame[1], frame[2], frame[proto.HeaderSize:]
+	name := map[byte]string{proto.TypeData: "DATA", proto.TypeHeaders: "HEADERS"}[typ]
+	if name == "" {
+		name = fmt.Sprintf("type=0x%02x (unknown, skipped)", typ)
+	}
+	fmt.Fprintf(d.w, "%s %s flags=0x%02x length=%d\n", d.mark, name, flags, len(payload))
+	for line := range strings.Lines(hex.Dump(frame)) {
+		fmt.Fprintf(d.w, "%s %s", d.mark, line)
+	}
+	if typ == proto.TypeHeaders {
+		h, _ := proto.DecodeHeaders(payload)
+		for _, f := range h {
+			fmt.Fprintf(d.w, "%s   %s: %s\n", d.mark, f.Name, f.Value)
+		}
+	}
 }
