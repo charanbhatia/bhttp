@@ -121,3 +121,123 @@ A new frame type is skipped by v1 peers. A new flag is ignored by them. A new he
 05 00 07 62 63 75 72 6c 2f 31                       [5] user-agent     "bcurl/1"
 06 00 03 2a 2f 2a                                   [6] accept         "*/*"
 ```
+
+A complete request and response, annotated byte by byte, follows in [Annotated hexdump](#annotated-hexdump).
+
+## Annotated hexdump
+
+One complete exchange, captured from `./bserve ./www 9000` and `./bcurl -v localhost:9000/index.html`. Every byte is accounted for. Offsets are hex and count from the start of each frame, as in `bcurl -v`.
+
+### Request: 1 frame, 61 bytes
+
+```
+    frame header
+00  01                                               Version 1
+01  01                                               Type 0x01 = HEADERS
+02  01                                               Flags 0x01 = END: the request has no body
+03  00                                               Reserved, always 0
+04  00 00 00 35                                      Length 53: payload is bytes 08-3c
+    header block: 5 fields, every name from the static table
+08  01                                               Index 1 = :method
+09  00 03                                            ValueLen 3
+0b  47 45 54                                         "GET"
+0e  02                                               Index 2 = :path
+0f  00 0b                                            ValueLen 11
+11  2f 69 6e 64 65 78 2e 68 74 6d 6c                 "/index.html"
+1c  04                                               Index 4 = host
+1d  00 0e                                            ValueLen 14
+1f  6c 6f 63 61 6c 68 6f 73 74 3a 39 30 30 30        "localhost:9000"
+2d  05                                               Index 5 = user-agent
+2e  00 07                                            ValueLen 7
+30  62 63 75 72 6c 2f 31                             "bcurl/1"
+37  06                                               Index 6 = accept
+38  00 03                                            ValueLen 3
+3a  2a 2f 2a                                         "*/*"
+```
+
+The same request in HTTP/1.1 text is 84 bytes. Here each header name costs 1 byte.
+
+### Response: 2 frames, 162 bytes
+
+Frame 1, HEADERS (89 bytes):
+
+```
+    frame header
+00  01                                               Version 1
+01  01                                               Type 0x01 = HEADERS
+02  00                                               Flags 0x00, no END: DATA frames follow
+03  00                                               Reserved, always 0
+04  00 00 00 51                                      Length 81: payload is bytes 08-58
+    header block: 5 fields, every name from the static table
+08  03                                               Index 3 = :status
+09  00 03                                            ValueLen 3
+0b  32 30 30                                         "200"
+0e  07                                               Index 7 = content-type
+0f  00 18                                            ValueLen 24
+11  74 65 78 74 2f 68 74 6d 6c 3b 20 63 68 61 72 73  "text/html; chars"
+21  65 74 3d 75 74 66 2d 38                            ..."et=utf-8"
+29  08                                               Index 8 = content-length
+2a  00 02                                            ValueLen 2
+2c  36 35                                            "65"
+2e  09                                               Index 9 = server
+2f  00 08                                            ValueLen 8
+31  62 73 65 72 76 65 2f 31                          "bserve/1"
+39  0a                                               Index 10 = date
+3a  00 1d                                            ValueLen 29
+3c  4d 6f 6e 2c 20 30 35 20 4f 63 74 20 32 30 32 36  "Mon, 05 Oct 2026"
+4c  20 31 37 3a 31 37 3a 34 30 20 47 4d 54             ..." 17:17:40 GMT"
+```
+
+The same status line and headers in HTTP/1.1 text are 134 bytes.
+
+Frame 2, DATA (73 bytes). The body follows the 8-byte frame header unchanged:
+
+```
+    frame header
+00  01                                               Version 1
+01  00                                               Type 0x00 = DATA
+02  01                                               Flags 0x01 = END: last frame, the response is complete
+03  00                                               Reserved, always 0
+04  00 00 00 41                                      Length 65: payload is bytes 08-48
+    payload: the file, byte for byte
+08  3c 21 64 6f 63 74 79 70 65 20 68 74 6d 6c 3e 0a  body 0-15: "<!doctype html>\n"
+18  3c 74 69 74 6c 65 3e 62 68 74 74 70 3c 2f 74 69  body 16-31: "<title>bhttp</ti"
+28  74 6c 65 3e 0a 3c 68 31 3e 48 65 6c 6c 6f 20 6f  body 32-47: "tle>\n<h1>Hello o"
+38  76 65 72 20 62 68 74 74 70 2f 31 3c 2f 68 31 3e  body 48-63: "ver bhttp/1</h1>"
+48  0a                                               body 64: "\n"
+```
+
+<details><summary>The raw <code>bcurl -v</code> output these tables annotate</summary>
+
+```
+> HEADERS flags=0x01 length=53
+> 00000000  01 01 01 00 00 00 00 35  01 00 03 47 45 54 02 00  |.......5...GET..|
+> 00000010  0b 2f 69 6e 64 65 78 2e  68 74 6d 6c 04 00 0e 6c  |./index.html...l|
+> 00000020  6f 63 61 6c 68 6f 73 74  3a 39 30 30 30 05 00 07  |ocalhost:9000...|
+> 00000030  62 63 75 72 6c 2f 31 06  00 03 2a 2f 2a           |bcurl/1...*/*|
+>   :method: GET
+>   :path: /index.html
+>   host: localhost:9000
+>   user-agent: bcurl/1
+>   accept: */*
+< HEADERS flags=0x00 length=81
+< 00000000  01 01 00 00 00 00 00 51  03 00 03 32 30 30 07 00  |.......Q...200..|
+< 00000010  18 74 65 78 74 2f 68 74  6d 6c 3b 20 63 68 61 72  |.text/html; char|
+< 00000020  73 65 74 3d 75 74 66 2d  38 08 00 02 36 35 09 00  |set=utf-8...65..|
+< 00000030  08 62 73 65 72 76 65 2f  31 0a 00 1d 4d 6f 6e 2c  |.bserve/1...Mon,|
+< 00000040  20 30 35 20 4f 63 74 20  32 30 32 36 20 31 37 3a  | 05 Oct 2026 17:|
+< 00000050  31 37 3a 34 30 20 47 4d  54                       |17:40 GMT|
+<   :status: 200
+<   content-type: text/html; charset=utf-8
+<   content-length: 65
+<   server: bserve/1
+<   date: Mon, 05 Oct 2026 17:17:40 GMT
+< DATA flags=0x01 length=65
+< 00000000  01 00 01 00 00 00 00 41  3c 21 64 6f 63 74 79 70  |.......A<!doctyp|
+< 00000010  65 20 68 74 6d 6c 3e 0a  3c 74 69 74 6c 65 3e 62  |e html>.<title>b|
+< 00000020  68 74 74 70 3c 2f 74 69  74 6c 65 3e 0a 3c 68 31  |http</title>.<h1|
+< 00000030  3e 48 65 6c 6c 6f 20 6f  76 65 72 20 62 68 74 74  |>Hello over bhtt|
+< 00000040  70 2f 31 3c 2f 68 31 3e  0a                       |p/1</h1>.|
+```
+
+</details>
